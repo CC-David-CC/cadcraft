@@ -21,6 +21,7 @@ pub struct DocState {
     pub path: Option<String>,
     pub title: String,
     pub saved: Arc<Drawing>,
+    pub(crate) save_generation: u64,
     pub revision: u64,
     pub space: Space,
     /// Tiled model viewports (VPORTS).
@@ -49,6 +50,7 @@ impl DocState {
         let doc = Arc::new(doc);
         DocState {
             saved: doc.clone(),
+            save_generation: 0,
             doc,
             undo: Vec::new(),
             redo: Vec::new(),

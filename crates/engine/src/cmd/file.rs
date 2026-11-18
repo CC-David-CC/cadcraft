@@ -5,7 +5,7 @@
 mod pgp;
 mod template;
 
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use cadcraft_doc::{Drawing, Format};
 pub use craft_dxf::Version;
@@ -716,12 +716,123 @@ fn commit_save(s: &mut Session, path: &str, bytes: &[u8], store: impl FnOnce(&st
         return Ok(bytes.len());
     }
     let st = s.state_mut()?;
+    st.save_generation = st.save_generation.wrapping_add(1);
     st.saved = st.drawing().clone();
     st.path = Some(path.to_string());
     st.title = file_name(path);
     // A BEgin group still open when the drawing is saved ends there.
     st.end_undo_group();
     Ok(bytes.len())
+}
+
+/// The drawing that an account save has serialized and is waiting to confirm.
+pub struct PreparedAccountSave {
+    document: u64,
+    revision: u64,
+    generation: u64,
+    original_path: Option<String>,
+    original_saved: Arc<Drawing>,
+    snapshot: Arc<Drawing>,
+    destination: String,
+    binary: bool,
+}
+
+const ACCOUNT_DRAWING_BYTES: usize = 128 << 20;
+
+fn account_dxf_path(command: &str, path: &str) -> Result<()> {
+    if path.len() > 2048
+        || !is_dxf_file(path)
+        || path.split('/').any(|part| matches!(part, "" | "." | ".."))
+        || path.chars().any(|ch| ch == '\\' || ch.is_control())
+    {
+        return Err(bad(command, "Choose an account-relative .dxf file."));
+    }
+    Ok(())
+}
+
+impl Session {
+    /// Capture the active drawing with the native DXF encoder before asking account Storage to write.
+    pub fn prepare_account_save(&self, path: &str) -> Result<(PreparedAccountSave, Vec<u8>)> {
+        account_dxf_path("save", path)?;
+        let state = self.state()?;
+        if self.running.is_some() || self.editing_mtext().is_some() || state.block_edit.is_some() || self.doc()?.refedit.is_some() {
+            return Err(bad("save", "Finish the current drafting command before saving."));
+        }
+        if !loss_on_save(self, path).is_empty() {
+            return Err(bad("save", "The drawing contains entities that this DXF version cannot preserve."));
+        }
+        let options = SaveAs { binary: state.binary_dxf, ..SaveAs::default() };
+        let bytes = write_bytes(self, "save", path, &options)?;
+        if bytes.len() > ACCOUNT_DRAWING_BYTES {
+            return Err(bad("save", "The drawing exceeds the WebOS account file size limit."));
+        }
+        Ok((
+            PreparedAccountSave {
+                document: state.uid,
+                revision: state.revision,
+                generation: state.save_generation,
+                original_path: state.path.clone(),
+                original_saved: state.saved.clone(),
+                snapshot: state.drawing().clone(),
+                destination: path.to_owned(),
+                binary: options.binary,
+            },
+            bytes,
+        ))
+    }
+
+    /// Adopt the captured drawing after a matching server write. Newer edits stay dirty.
+    pub fn adopt_account_save(&mut self, save: PreparedAccountSave) -> Result<()> {
+        let state = self.state_mut()?;
+        if state.uid != save.document
+            || state.save_generation != save.generation
+            || state.path != save.original_path
+            || !Arc::ptr_eq(&state.saved, &save.original_saved)
+        {
+            return Err(bad("save", "The confirmed account save belongs to a different drawing revision."));
+        }
+        let current = state.revision == save.revision && Arc::ptr_eq(state.drawing(), &save.snapshot);
+        state.saved = save.snapshot;
+        state.save_generation = state.save_generation.wrapping_add(1);
+        state.title = file_name(&save.destination);
+        state.path = Some(save.destination);
+        state.binary_dxf = save.binary;
+        if current {
+            state.end_undo_group();
+        }
+        Ok(())
+    }
+
+    /// Capture native drawing bytes for browser recovery without changing the account binding.
+    pub fn capture_account_draft(&self) -> Result<Vec<u8>> {
+        self.prepare_account_save("Drawing.dxf").map(|(_, bytes)| bytes)
+    }
+
+    /// Open a host-authorized DXF or browser draft.
+    pub fn open_account_drawing(&mut self, path: Option<&str>, bytes: &[u8], recover: bool) -> Result<Value> {
+        if let Some(path) = path {
+            account_dxf_path("open", path)?;
+        } else if !recover {
+            return Err(bad("open", "Choose an account drawing."));
+        }
+        if bytes.is_empty() || bytes.len() > ACCOUNT_DRAWING_BYTES {
+            return Err(bad("open", "The account drawing size is invalid."));
+        }
+        if bytes.starts_with(b"AC") && bytes.get(2..6).is_some_and(|version| version.iter().all(u8::is_ascii_digit)) {
+            return Err(bad("open", "Choose a DXF drawing for WebOS account editing."));
+        }
+        let title = path.unwrap_or("Drawing.dxf");
+        let file = read_bytes(bytes, title, None)?;
+        if !file.drawing.skipped_records.is_empty() {
+            return Err(bad("open", "CADCraft could not read all drawing records. Open a repaired DXF for account editing."));
+        }
+        let index = add_read(self, file.drawing, file.binary_dxf, &file.name, path.map(str::to_owned));
+        if recover {
+            let state = self.state_mut()?;
+            state.saved = Arc::new((*state.doc).clone());
+        }
+        Ok(opened(self, index, true))
+    }
 }
 
 /// The save result; on the web it also names the file the browser downloaded.

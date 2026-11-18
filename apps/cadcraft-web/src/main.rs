@@ -11,6 +11,10 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 #[cfg(target_arch = "wasm32")]
+mod account;
+#[cfg(target_arch = "wasm32")]
+mod account_port;
+#[cfg(target_arch = "wasm32")]
 mod api;
 #[cfg(target_arch = "wasm32")]
 pub mod download;
@@ -22,6 +26,7 @@ mod panel_layout;
 
 #[cfg(target_arch = "wasm32")]
 mod web {
+    use crate::{account, account_port::AccountPort};
     use cadcraft_engine::Session;
     use cadcraft_ui_egui::{CadApp, Services};
     use wasm_bindgen::JsCast as _;
@@ -34,7 +39,14 @@ mod web {
     /// `prefers-reduced-motion` (it stays
     /// live, so View ▸ Accessibility ▸ Animation Effects ▸ Use System Setting follows a change),
     /// and the document title last written to the page.
-    struct Shell(CadApp, crate::upload::Inbox, Option<crate::host::Bridge>, Option<web_sys::MediaQueryList>, Option<String>);
+    struct Shell(
+        CadApp,
+        crate::upload::Inbox,
+        Option<crate::host::Bridge>,
+        Option<web_sys::MediaQueryList>,
+        Option<String>,
+        Option<account::AccountView>,
+    );
 
     impl eframe::App for Shell {
         /// Runs one frame: takes in files dropped on or picked for the page, drains the background
@@ -44,7 +56,14 @@ mod web {
         fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
             // Background reads are consume-based and run on hidden ticks too. Dropped files are
             // input and are read from `ui` only.
-            self.1.drain(&mut self.0);
+            if let Some(account) = &mut self.5 {
+                account.poll(&mut self.0);
+                if account.suspended() {
+                    return;
+                }
+            } else {
+                self.1.drain(&mut self.0);
+            }
             self.0.system_animations = self.3.as_ref().map(|reduced| !reduced.matches());
             self.0.logic(ctx);
             let drawing = self.0.session.state().ok();
@@ -54,14 +73,29 @@ mod web {
             if let Some(bridge) = &self.2 {
                 bridge.report_dirty(&self.0);
             }
+            if let Some(account) = &mut self.5
+                && let Err(error) = account.publish_state(&self.0)
+            {
+                self.0.set_status(error);
+            }
         }
         /// Forward raw input to the web `CadApp` and capture Tab at the command line.
         fn raw_input_hook(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {
+            if let Some(account) = &self.5 {
+                raw.dropped_files.clear();
+                if account.suspended() {
+                    raw.events.clear();
+                    return;
+                }
+            }
             self.0.raw_input_hook(ctx, raw);
             cadcraft_ui_egui::cmdline::capture_tab(ctx, raw);
         }
         /// Preferences and validated panel placement survive reloads; egui memory is not kept.
         fn save(&mut self, storage: &mut dyn eframe::Storage) {
+            if self.5.is_some() {
+                return;
+            }
             storage.set_string(cadcraft_ui_egui::options::PROFILE_KEY, self.0.profile_json());
             storage.set_string(cadcraft_ui_egui::PREFS_KEY, self.0.prefs_json());
             match crate::panel_layout::save(&self.0.ui) {
@@ -75,12 +109,14 @@ mod web {
         /// On the first pass consume files dropped on the page, then delegate drawing to `CadApp::ui`.
         fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
             let first_pass = ui.ctx().current_pass_index() == 0;
-            if first_pass {
+            if first_pass && self.5.is_none() {
                 // `take_dropped` consumes the raw list; a second pass or hidden tick cannot
                 // re-read the same file.
                 self.1.take_dropped(ui.ctx());
             }
-            self.0.ui(ui);
+            if !self.5.as_ref().is_some_and(account::AccountView::suspended) {
+                self.0.ui(ui);
+            }
         }
     }
 
@@ -96,6 +132,14 @@ mod web {
 
     fn query() -> String {
         web_sys::window().and_then(|w| w.location().search().ok()).unwrap_or_default()
+    }
+
+    fn deliver_account_export(name: &str, mime: &str, bytes: &[u8]) -> Result<(), String> {
+        let suffix = std::path::Path::new(name).extension().and_then(std::ffi::OsStr::to_str).unwrap_or("");
+        if ["", "dxf", "dwg", "dwt"].iter().any(|candidate| suffix.eq_ignore_ascii_case(candidate)) {
+            return Err("Save drawings through the WebOS account window.".into());
+        }
+        crate::download::download(name, mime, bytes)
     }
 
     /// The app's canvas: the one element `index.html` and every embedding page must provide,
@@ -138,17 +182,45 @@ mod web {
         // `CustomEvent`s on the canvas (`host`). With neither, there is no file system here:
         // saved files reach the user as browser downloads; an unframed `?host=parent` stays
         // that normal app.
-        let bridge = crate::host::Bridge::connect(&canvas);
+        let account_host =
+            web_sys::UrlSearchParams::new_with_str(&query()).ok().and_then(|query| query.get("host")).as_deref() == Some("webos-account");
+        let bridge = (!account_host).then(|| crate::host::Bridge::connect(&canvas)).flatten();
         match &bridge {
             Some(bridge) => {
                 bridge.install();
                 cadcraft_engine::cmd::file::set_deliver(crate::host::deliver);
             }
+            None if account_host => cadcraft_engine::cmd::file::set_deliver(deliver_account_export),
             None => cadcraft_engine::cmd::file::set_deliver(crate::download::download),
         }
         let app_bridge = bridge.clone();
         wasm_bindgen_futures::spawn_local(async move {
             let Some(document) = web_sys::window().and_then(|w| w.document()) else { return };
+            let port = if account_host {
+                match AccountPort::connect() {
+                    Ok(port) => Some(port),
+                    Err(error) => {
+                        if let Some(loading) = document.get_element_by_id(LOADING_ID) {
+                            loading.set_text_content(Some(&error));
+                        }
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
+            let (initial_session, identity) = if let Some(port) = &port {
+                match account::open(port).await {
+                    Ok((session, identity)) => (Some(session), Some(identity)),
+                    Err(error) => {
+                        port.startup_failed(&error);
+                        return;
+                    }
+                }
+            } else {
+                (None, None)
+            };
+            let app_port = port.clone();
             let mut options = eframe::WebOptions::default();
             if query().contains("webgl")
                 && let eframe::egui_wgpu::WgpuSetup::CreateNew(create) = &mut options.wgpu_options.wgpu_setup
@@ -161,18 +233,21 @@ mod web {
                     options,
                     Box::new(move |cc| {
                         // Embedded, the host sends the drawing: start on the Start tab, not Drawing1.
-                        let session = if app_bridge.is_some() { Session::empty() } else { Session::new() };
-                        let control = crate::api::install(cc.egui_ctx.clone());
-                        let mut app = CadApp::new(session, services()).with_control(control);
+                        let session = initial_session.unwrap_or_else(|| if app_bridge.is_some() { Session::empty() } else { Session::new() });
+                        let mut app = CadApp::new(session, services());
+                        if !account_host {
+                            app = app.with_control(crate::api::install(cc.egui_ctx.clone()));
+                        }
                         app.system_languages =
                             web_sys::window().map(|w| w.navigator().languages().iter().filter_map(|v| v.as_string()).collect()).unwrap_or_default();
-                        if let Some(profile) = cc.storage.and_then(|s| s.get_string(cadcraft_ui_egui::options::PROFILE_KEY)) {
+                        if !account_host && let Some(profile) = cc.storage.and_then(|s| s.get_string(cadcraft_ui_egui::options::PROFILE_KEY)) {
                             app.load_profile(&profile);
                         }
-                        if let Some(prefs) = cc.storage.and_then(|s| s.get_string(cadcraft_ui_egui::PREFS_KEY)) {
+                        if !account_host && let Some(prefs) = cc.storage.and_then(|s| s.get_string(cadcraft_ui_egui::PREFS_KEY)) {
                             app.load_prefs(&prefs);
                         }
-                        if let Some(layout) = cc.storage.and_then(|s| s.get_string(crate::panel_layout::KEY))
+                        if !account_host
+                            && let Some(layout) = cc.storage.and_then(|s| s.get_string(crate::panel_layout::KEY))
                             && let Err(error) = crate::panel_layout::restore(&mut app.ui, &layout)
                         {
                             log::warn!("panel layout was not restored: {error}");
@@ -185,28 +260,47 @@ mod web {
                             // viewports stay in the layout's display list.
                             app.set_wgpu(rs, None);
                         }
-                        if query().contains("sample") {
+                        if !account_host && query().contains("sample") {
                             let _ = app.run("ui.sample", serde_json::json!({}));
                         }
                         // No paths on the web: OPEN asks the browser's file picker, which reads the
                         // chosen file in the background (`upload.rs`), so the picker returns none.
                         let inbox = crate::upload::Inbox::new(&cc.egui_ctx);
-                        let picker = inbox.clone();
-                        app.services.pick_open = Some(Box::new(move || {
-                            picker.pick();
-                            None
-                        }));
+                        if !account_host {
+                            let picker = inbox.clone();
+                            app.services.pick_open = Some(Box::new(move || {
+                                picker.pick();
+                                None
+                            }));
+                        }
+                        let account = app_port.map(|port| {
+                            port.wake_on(cc.egui_ctx.clone());
+                            let account = account::AccountView::new(port);
+                            app.account_drawing = Some(account.drawing_service());
+                            account
+                        });
                         let host = app_bridge.inspect(|bridge| {
                             bridge.listen(inbox.clone());
                             bridge.post_ready();
                         });
                         let reduced_motion = web_sys::window().and_then(|w| w.match_media("(prefers-reduced-motion: reduce)").ok().flatten());
-                        Ok(Box::new(Shell(app, inbox, host, reduced_motion, None)))
+                        Ok(Box::new(Shell(app, inbox, host, reduced_motion, None, account)))
                     }),
                 )
                 .await;
             if let (Err(e), Some(bridge)) = (&result, &bridge) {
                 bridge.post_failed(&format!("{e:?}"));
+            }
+            if let Some(port) = &port {
+                match (&result, identity) {
+                    (Ok(()), Some(identity)) => {
+                        if let Err(error) = port.publish("started", identity, None) {
+                            port.startup_failed(&error);
+                        }
+                    }
+                    (Err(error), _) => port.startup_failed(&format!("{error:?}")),
+                    _ => {}
+                }
             }
             if let Some(el) = document.get_element_by_id(LOADING_ID) {
                 match result {
@@ -280,6 +374,63 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{document_title, push_title, title_to_send, wants_cpu};
+
+    #[test]
+    fn a_confirmed_account_save_retains_newer_drafting_edits_and_rejects_stale_receipts() {
+        use cadcraft_engine::{
+            Session,
+            cmd::file::{IoHooks, set_io},
+        };
+        use serde_json::json;
+
+        set_io(IoHooks {
+            read: |bytes, name| cadcraft_io::read(bytes, name).map_err(|error| error.to_string()),
+            write: |drawing, name| cadcraft_io::write(drawing, name).map_err(|error| error.to_string()),
+            plot: None,
+        });
+        let mut session = Session::new();
+        session.cmdline("circle 4,4 1").unwrap();
+        let path = "Drawings/Plan.dxf";
+        let (receipt, bytes) = session.prepare_account_save(path).unwrap();
+        let (duplicate, _) = session.prepare_account_save(path).unwrap();
+        assert!(!bytes.is_empty());
+        assert!(session.state().unwrap().is_dirty() && session.state().unwrap().path.is_none());
+        assert!(session.prepare_account_save("../Plan.dxf").is_err());
+        assert!(session.prepare_account_save("Plan.dwg").is_err());
+
+        session.execute("line", &json!({"points":[[2,2],[5,8]]})).unwrap();
+        session.adopt_account_save(receipt).unwrap();
+        let state = session.state().unwrap();
+        assert!(state.is_dirty());
+        assert_eq!((state.path.as_deref(), state.title.as_str()), (Some(path), "Plan.dxf"));
+        assert!(session.adopt_account_save(duplicate).is_err());
+
+        let (receipt, _) = session.prepare_account_save(path).unwrap();
+        session.adopt_account_save(receipt).unwrap();
+        assert!(!session.state().unwrap().is_dirty());
+        let (previous_document, _) = session.prepare_account_save(path).unwrap();
+        session.execute("new", &json!({})).unwrap();
+        assert!(session.adopt_account_save(previous_document).is_err());
+        assert!(session.state().unwrap().path.is_none());
+
+        let mut reopened = Session::empty();
+        assert!(reopened.open_account_drawing(Some(path), b"AC1032", false).is_err());
+        assert!(reopened.open_account_drawing(Some(path), b"bad data", false).is_err());
+        assert!(reopened.open_account_drawing(None, &bytes, false).is_err());
+        assert!(reopened.docs.is_empty());
+        reopened.open_account_drawing(Some(path), &bytes, false).unwrap();
+        assert_eq!(reopened.state().unwrap().path.as_deref(), Some(path));
+        assert!(!reopened.state().unwrap().is_dirty());
+        assert_eq!(reopened.doc().unwrap().model.len(), 1);
+        reopened.cmdline("circle 6,6 1").unwrap();
+        let draft = reopened.capture_account_draft().unwrap();
+        for binding in [Some(path), None] {
+            reopened.open_account_drawing(binding, &draft, true).unwrap();
+            assert_eq!(reopened.state().unwrap().path.as_deref(), binding);
+            assert!(reopened.state().unwrap().is_dirty());
+            assert_eq!(reopened.doc().unwrap().model.len(), 2);
+        }
+    }
 
     /// Guards the `?cpu` URL flag: only a whole `cpu` query parameter (bare or with a value)
     /// selects the CPU canvas, so `?sample` and `?gpucpu` stay on the GPU path.

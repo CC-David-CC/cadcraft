@@ -42,6 +42,12 @@ impl CadApp {
     /// Close one drawing (`None`: the active one) as the user asked for it: a drawing with unsaved
     /// changes asks Save / Don't Save / Cancel first.
     pub fn request_close(&mut self, index: Option<usize>) {
+        if let Some(account) = self.account_drawing.as_ref() {
+            if let Err(error) = account(crate::AccountDrawingRequest::Close) {
+                self.set_status(error);
+            }
+            return;
+        }
         let i = index.unwrap_or(self.session.active);
         match self.session.docs.get(i) {
             Some(d) => {

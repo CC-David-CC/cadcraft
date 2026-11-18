@@ -376,6 +376,22 @@ fn user_qsave(app: &mut CadApp) -> Option<Result<Value, String>> {
 }
 
 fn run_ui_command_inner(app: &mut CadApp, id: &str, params: &Value) -> Option<Result<Value, String>> {
+    if let Some(account) = app.account_drawing.as_ref() {
+        use crate::AccountDrawingRequest as Request;
+        let action = match id {
+            "new" | "qnew" => Some(Request::New),
+            "open" | "ui.open" => Some(Request::Open(params["path"].as_str().map(str::to_owned))),
+            "qsave" | "save" => Some(Request::Save),
+            "saveas" | "ui.saveas" => Some(Request::SaveAs),
+            "close" | "closeall" | "ui.quit" => Some(Request::Close),
+            "recover" => return Some(Err("Use the WebOS account window to recover a drawing.".into())),
+            "ui.newtemplate" => return Some(Err("Drawing templates are unavailable in the WebOS account window.".into())),
+            _ => None,
+        };
+        if let Some(action) = action {
+            return Some(account(action).map(|()| Value::Null));
+        }
+    }
     if let Some(result) = route_ui_subsystems(app, id, params) {
         return Some(result);
     }
@@ -971,6 +987,38 @@ pub fn shortcuts(app: &mut CadApp, ctx: &egui::Context) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn account_file_commands_wait_for_the_host_and_leave_the_current_drawing_untouched() {
+        use crate::AccountDrawingRequest as Request;
+        use std::{cell::RefCell, rc::Rc};
+
+        let mut app = crate::CadApp::new(cadcraft_engine::Session::new(), crate::Services::default());
+        app.session.cmdline("circle 4,4 1").unwrap();
+        let uid = app.session.state().unwrap().uid;
+        let requests = Rc::new(RefCell::new(Vec::new()));
+        let sent = requests.clone();
+        app.account_drawing = Some(Box::new(move |action| {
+            sent.borrow_mut().push(action);
+            Ok(())
+        }));
+        for (command, params) in [
+            ("new", serde_json::Value::Null),
+            ("open", serde_json::json!({"path":"Drawings/Other.dxf"})),
+            ("qsave", serde_json::Value::Null),
+            ("ui.saveas", serde_json::Value::Null),
+            ("close", serde_json::Value::Null),
+        ] {
+            assert!(super::run_ui_command(&mut app, command, &params).unwrap().is_ok());
+        }
+        assert_eq!(
+            *requests.borrow(),
+            [Request::New, Request::Open(Some("Drawings/Other.dxf".into())), Request::Save, Request::SaveAs, Request::Close]
+        );
+        let drawing = app.session.state().unwrap();
+        assert_eq!(drawing.uid, uid);
+        assert!(drawing.is_dirty() && drawing.path.is_none());
+    }
+
     use std::cell::RefCell;
     use std::rc::Rc;
 

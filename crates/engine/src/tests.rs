@@ -1561,3 +1561,22 @@ fn additional_tools_keeps_compatible_command_ids() {
         assert!(!command.menu.contains(&"Express Tools"));
     }
 }
+
+#[test]
+fn account_drawing_cannot_replace_or_close_itself_through_engine_file_commands() {
+    let mut session = Session::account_drawing();
+    session.new_drawing(false);
+    session.execute("line", &json!({"points":[[1,2],[7,2]]})).unwrap();
+    let uid = session.state().unwrap().uid;
+    for command in ["new", "open", "close", "closeall", "qsave", "saveas", "recover"] {
+        assert!(matches!(session.execute(command, &json!({})), Err(crate::EngineError::Disabled(_, _))));
+        assert!(matches!(session.start(command), Err(crate::EngineError::Disabled(_, _))));
+    }
+    assert!(matches!(session.cmdline("qnew {}"), Err(crate::EngineError::Disabled(_, _))));
+    assert!(matches!(session.cmdline("_closeall"), Err(crate::EngineError::Disabled(_, _))));
+    assert_eq!(session.docs.len(), 1);
+    let drawing = session.state().unwrap();
+    assert_eq!(drawing.uid, uid);
+    assert!(drawing.is_dirty() && drawing.path.is_none());
+    assert_eq!(drawing.drawing().entity_count(), 1);
+}

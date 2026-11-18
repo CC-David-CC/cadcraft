@@ -258,6 +258,18 @@ pub enum Pick {
 /// chosen path, or `None` when the dialog is cancelled ([`Services::start_pick`]).
 pub type StartPick = Box<dyn Fn(Pick, Box<dyn FnOnce(Option<String>) + Send>)>;
 
+/// Drawing actions whose result is owned by the account window.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AccountDrawingRequest {
+    New,
+    Open(Option<String>),
+    Save,
+    SaveAs,
+    Close,
+}
+
+pub type AccountDrawingFn = Box<dyn Fn(AccountDrawingRequest) -> Result<(), String>>;
+
 /// What to do with the path a file dialog chose ([`CadApp::pick_then`]).
 type PickDone = Box<dyn FnOnce(&mut CadApp, String) -> Result<Value, String>>;
 
@@ -286,6 +298,7 @@ pub struct CadApp {
     /// The interface's own preferences from the Options dialog ([`options`]).
     pub options: options::UiOptions,
     pub services: Services,
+    pub account_drawing: Option<AccountDrawingFn>,
     pub canvas: canvas::CanvasState,
     /// Desktop HID status and navigation preferences; the web host supplies no HID backend.
     pub spacemouse: spacemouse::State,
@@ -383,6 +396,7 @@ impl CadApp {
             ui: UiState::default(),
             options: options::UiOptions::default(),
             services,
+            account_drawing: None,
             canvas: canvas::CanvasState::default(),
             spacemouse: spacemouse::State::default(),
             quickcalc: palettes::quickcalc::State::default(),

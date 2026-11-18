@@ -86,6 +86,8 @@ pub struct Session {
     pub running: Option<Running>,
     /// A script is running ([`Session::script`]); a SCRIPT command inside it is refused.
     in_script: bool,
+    /// The host owns this drawing's lifetime and account file binding.
+    account_managed_drawing: bool,
     /// The command suspended while a transparent command (`'ZOOM`, `'PAN`…) prompts inside it;
     /// it resumes when that command ends. One level, as in AutoCAD.
     pub suspended: Option<Running>,
@@ -167,6 +169,18 @@ impl Session {
         s.new_drawing(false);
         s
     }
+    /// Start a drawing session whose file operations are owned by the account host.
+    pub fn account_drawing() -> Self {
+        Self { account_managed_drawing: true, ..Self::empty() }
+    }
+
+    fn require_local_file_command(&self, id: &str) -> Result<()> {
+        if self.account_managed_drawing && matches!(id, "new" | "open" | "close" | "closeall" | "qsave" | "saveas" | "recover") {
+            return Err(EngineError::Disabled(id.to_owned(), "Use the WebOS account window for drawing file operations.".into()));
+        }
+        Ok(())
+    }
+
     /// A session with no open drawing (the Start tab).
     pub fn empty() -> Self {
         Session {
@@ -176,6 +190,7 @@ impl Session {
             settings: Settings::default(),
             running: None,
             in_script: false,
+            account_managed_drawing: false,
             suspended: None,
             log: Vec::new(),
             last_command: None,

@@ -39,6 +39,7 @@ impl Session {
             }
             return Err(EngineError::UnknownCommand(name.to_string()));
         };
+        self.require_local_file_command(spec.id)?;
         if transparent && spec.transparent && self.running.is_some() {
             // Transparent commands (zoom, pan…) run without cancelling the active one.
             if spec.interactive.is_none() {
